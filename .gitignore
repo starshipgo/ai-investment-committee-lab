@@ -1,0 +1,33 @@
+# Secrets and machine-specific configuration
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Local application and LumiBot runtime state
+.cache/
+.lumibot/
+work/
+.streamlit/
+.agents/
+
+# Generated experiment output
+artifacts/*
+!artifacts/.gitkeep
+logs/
+*.parquet
+*.sqlite
+*.db
