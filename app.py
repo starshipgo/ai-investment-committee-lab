@@ -71,7 +71,8 @@ class RiskGateRow:
 class RunView:
     """A stable adapter between saved artifacts and Streamlit components."""
 
-    run_name: str
+    run_label: str
+    artifact_id: str
     data_source: str
     lookback_window: str
     max_position_size: str
@@ -91,7 +92,8 @@ class RunView:
 class TodayView:
     """Presentation-only content for one saved current-data analysis."""
 
-    run_name: str
+    run_label: str
+    artifact_id: str
     data_source: str
     analysis_timestamp: str
     evidence_as_of: str
@@ -298,7 +300,10 @@ def safe_experiment_failure(error: Exception) -> tuple[str, str]:
 def render_experiment_controls() -> tuple[ExperimentSettings, bool]:
     """Render the only interactive parameters and the explicit run action."""
 
-    st.subheader("New learning experiment")
+    st.caption(
+        "Changes below create or reuse a separate experiment. They never modify the saved "
+        "result displayed above."
+    )
     lookback_column, max_position_column = st.columns(2)
     with lookback_column:
         lookback_days = st.slider(
@@ -320,7 +325,7 @@ def render_experiment_controls() -> tuple[ExperimentSettings, bool]:
         )
         st.caption("Changes what the AI is allowed to execute.")
 
-    st.warning(
+    st.info(
         "Run New Experiment may invoke the Gemini model API. An identical completed experiment "
         "is loaded instead when available."
     )
@@ -337,7 +342,10 @@ def render_experiment_controls() -> tuple[ExperimentSettings, bool]:
 def render_today_controls() -> tuple[TodaySettings, bool]:
     """Render the explicit controls for a current-data analysis-only observation."""
 
-    st.subheader("Today's committee")
+    st.caption(
+        "Changes below create a separate analysis. They never modify the saved analysis "
+        "displayed above."
+    )
     lookback_column, max_position_column = st.columns(2)
     with lookback_column:
         lookback_days = st.slider(
@@ -361,7 +369,7 @@ def render_today_controls() -> tuple[TodaySettings, bool]:
         )
         st.caption("Changes only what deterministic Python allows to pass the Risk Gate.")
 
-    st.warning(
+    st.info(
         "Run Today's Committee may invoke the Gemini model API and fetch current Yahoo data. "
         "It is analysis only and cannot submit an order."
     )
@@ -398,10 +406,10 @@ def run_requested_experiment(settings: ExperimentSettings) -> Path | None:
             return None
         if result.reused:
             status.update(label="Loaded matching completed experiment", state="complete")
-            status.write(f"Reused saved run: {artifact_dir.name}")
+            status.write("A matching completed backtest was reused.")
         else:
             status.update(label="Experiment complete", state="complete")
-            status.write(f"Saved new run: {artifact_dir.name}")
+            status.write("A new timestamped backtest artifact was saved.")
         return artifact_dir
 
 
@@ -427,7 +435,7 @@ def run_requested_today_analysis(settings: TodaySettings) -> Path | None:
             )
             return None
         status.update(label="Today's analysis complete", state="complete")
-        status.write(f"Saved new analysis: {artifact_dir.name}")
+        status.write("A new timestamped Today analysis artifact was saved.")
         return artifact_dir
 
 
@@ -481,6 +489,24 @@ def format_timestamp(value: Any) -> str:
     zone = timestamp.strftime("%Z")
     suffix = f" {zone}" if zone else ""
     return f"{timestamp.strftime('%B')} {timestamp.day}, {timestamp.year} at {timestamp:%H:%M}{suffix}"
+
+
+def format_saved_run_label(kind: str, artifact_id: str) -> str:
+    """Turn a timestamped artifact directory name into a human-readable saved-run label."""
+
+    match = re.fullmatch(
+        r"(?P<date>\d{8})T(?P<time>\d{6})(?:\d+)?Z",
+        artifact_id,
+    )
+    if match is None:
+        return f"Saved {kind}"
+    date = match.group("date")
+    time = match.group("time")
+    created_at = (
+        f"{date[:4]}-{date[4:6]}-{date[6:]}T"
+        f"{time[:2]}:{time[2:4]}:{time[4:]}+00:00"
+    )
+    return f"{kind} · saved {format_timestamp(created_at)}"
 
 
 def decision_by_role(decisions: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -538,13 +564,16 @@ def _plain_text_from_markdown(markdown: str) -> str:
 
 
 def concise_summary(markdown: Any, limit: int = 360) -> str:
-    """Derive a short, readable preview from a saved agent response."""
+    """Derive a short, readable preview of no more than three saved-response sentences."""
 
     saved_text = str(markdown or "").strip()
     if not saved_text:
         return "No saved summary is available for this role."
     result = RESULT_MARKER.search(saved_text)
     plain_text = _plain_text_from_markdown(saved_text[result.end() :] if result else saved_text)
+    sentence_ends = list(re.finditer(r"[.!?](?=\s|$)", plain_text))
+    if len(sentence_ends) > 3:
+        plain_text = plain_text[: sentence_ends[2].end()].strip()
     if len(plain_text) <= limit:
         return plain_text or "No saved summary is available for this role."
     sentence_end = max(
@@ -599,7 +628,7 @@ def build_risk_rows(risk: pd.DataFrame) -> tuple[RiskGateRow, ...]:
     rows: list[RiskGateRow] = []
     for _, row in risk.iterrows():
         raw_reason = row.get("reason", "")
-        reason = "" if pd.isna(raw_reason) else str(raw_reason).replace("_", " ")
+        reason = format_risk_reason(raw_reason)
         rows.append(
             RiskGateRow(
                 symbol=str(row["symbol"]),
@@ -610,6 +639,27 @@ def build_risk_rows(risk: pd.DataFrame) -> tuple[RiskGateRow, ...]:
             )
         )
     return tuple(rows)
+
+
+def format_risk_reason(raw_reason: Any) -> str:
+    """Replace stored machine labels with concise, human-readable UI copy."""
+
+    if pd.isna(raw_reason):
+        return "Approved"
+    raw_text = str(raw_reason).strip()
+    normalized = re.sub(r"[\s-]+", "_", raw_text.lower())
+    position_limit = re.fullmatch(
+        r"max_position_(?P<limit>\d+(?:\.\d+)?)pct",
+        normalized,
+    )
+    if position_limit is not None:
+        limit = position_limit.group("limit").rstrip("0").rstrip(".")
+        return f"Capped by {limit}% position limit"
+    if normalized == "residual_after_risk_gate":
+        return "Unallocated capital"
+    if normalized == "approved":
+        return "Approved"
+    return raw_text.replace("_", " ") or "Approved"
 
 
 def build_equity_chart(equity: pd.DataFrame) -> pd.DataFrame:
@@ -634,7 +684,8 @@ def build_presenter_data(run_dir: Path, run: dict[str, Any]) -> RunView:
     decisions_by_role = decision_by_role(run["decisions"])
     risk_limits = summary.get("risk_limits", {})
     return RunView(
-        run_name=run_dir.name,
+        run_label=format_saved_run_label("Historical backtest", run_dir.name),
+        artifact_id=run_dir.name,
         data_source=str(summary.get("data_source", "Saved artifacts only")),
         lookback_window=find_lookback_window(summary, decisions_by_role),
         max_position_size=format_percent(float(risk_limits.get("max_position_weight", 0.25))),
@@ -664,7 +715,8 @@ def build_today_presenter_data(analysis_dir: Path, analysis: dict[str, Any]) -> 
     except (KeyError, TypeError, ValueError):
         lookback_days = 0
     return TodayView(
-        run_name=analysis_dir.name,
+        run_label=format_saved_run_label("Today analysis", analysis_dir.name),
+        artifact_id=analysis_dir.name,
         data_source=str(summary.get("data_source", "YahooData")),
         analysis_timestamp=format_timestamp(summary.get("analysis_timestamp")),
         evidence_as_of=format_timestamp(summary.get("evidence_as_of")),
@@ -677,214 +729,329 @@ def build_today_presenter_data(analysis_dir: Path, analysis: dict[str, Any]) -> 
     )
 
 
-def render_metric_summary(view: RunView) -> None:
-    st.subheader("Backtest summary")
-    metrics_columns = st.columns(4)
-    metrics_columns[0].metric("Portfolio total return", format_percent(view.total_return))
-    metrics_columns[1].metric("SPY benchmark return", format_percent(view.benchmark_return))
-    metrics_columns[2].metric("Max drawdown", format_percent(view.max_drawdown))
-    metrics_columns[3].metric("Sharpe ratio", f"{view.sharpe_ratio:.2f}")
-    st.markdown(f"**Backtest period:** {view.period}")
+def render_lab_styles() -> None:
+    """Apply restrained static styling without ever interpolating artifact content."""
 
-
-def render_equity_curve(equity_chart: pd.DataFrame) -> None:
-    st.subheader("Equity curve vs SPY")
-    st.line_chart(equity_chart, width="stretch")
-
-
-def render_agent_card(column: Any, card: AgentCard) -> None:
-    with column.container(border=True):
-        st.markdown(f"### {card.role}")
-        st.caption(card.description)
-        st.write(card.preview)
-        if card.details:
-            with st.expander("View details", expanded=False):
-                st.markdown(card.details, unsafe_allow_html=False)
-
-
-def render_agent_cards(cards: tuple[AgentCard, ...]) -> None:
-    st.subheader("AI committee decisions")
-    st.caption("Concise saved summaries first. Raw traces, tool logs, and hidden reasoning are not shown.")
-    for left_card, right_card in zip(cards[::2], cards[1::2], strict=True):
-        left, right = st.columns(2)
-        render_agent_card(left, left_card)
-        render_agent_card(right, right_card)
-
-
-def render_risk_gate(risk_rows: tuple[RiskGateRow, ...]) -> None:
-    st.subheader("Risk Gate")
-    st.markdown("### AI proposed weights → deterministic risk gate → executed weights")
-    overrides = tuple(row for row in risk_rows if row.overridden)
-    aapl = next((row for row in risk_rows if row.symbol == "AAPL"), None)
-    if aapl is not None and aapl.overridden:
-        st.error(
-            "Override applied: the Portfolio Manager proposed "
-            f"{format_percent(aapl.proposed_weight)} AAPL, but the deterministic risk "
-            f"gate limited execution to {format_percent(aapl.executed_weight)}."
-        )
-    elif overrides:
-        st.error(f"{len(overrides)} deterministic risk override(s) were applied.")
-    else:
-        st.success("No weights required a deterministic risk override in this run.")
-
-    heading = st.columns((1.1, 1.5, 2.4, 1.6))
-    heading[0].caption("Symbol")
-    heading[1].caption("AI proposed")
-    heading[2].caption("Risk Gate")
-    heading[3].caption("Executed")
-    for row in risk_rows:
-        columns = st.columns((1.1, 1.5, 2.4, 1.6))
-        columns[0].markdown(f"**{row.symbol}**")
-        columns[1].markdown(f"### {format_percent(row.proposed_weight)}")
-        if row.overridden:
-            columns[2].error(row.reason)
-        else:
-            columns[2].success("Approved")
-        columns[3].markdown(f"### {format_percent(row.executed_weight)}")
-
-
-def render_trades(trades_table: pd.DataFrame) -> None:
-    st.subheader("Simulated trades")
-    if trades_table.empty:
-        st.info("No simulated fills were saved for this run.")
-        return
-    st.dataframe(
-        trades_table,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "quantity": st.column_config.NumberColumn("quantity", format="%.0f"),
-            "fill price": st.column_config.NumberColumn("fill price", format="$%.2f"),
-            "notional": st.column_config.NumberColumn("notional", format="$%.2f"),
-        },
+    st.html(
+        """
+        <style>
+          .block-container {
+            max-width: 1180px;
+            padding-top: 2.5rem;
+            padding-bottom: 4rem;
+          }
+          .st-key-lab-current-experiment,
+          .st-key-lab-today-context {
+            background: #111924;
+            border: 1px solid #2a394b;
+          }
+          .st-key-lab-portfolio-manager {
+            background: #121c2a;
+            border: 1px solid #4a6b96;
+            border-left: 3px solid #83aef5;
+          }
+          .st-key-lab-risk-gate {
+            background: #17191d;
+            border: 1px solid #9d7729;
+            border-left: 3px solid #d6a744;
+          }
+          .st-key-lab-analysis-only {
+            background: #18202a;
+            border: 1px solid #61758d;
+            border-left: 3px solid #b9c8dc;
+          }
+          .st-key-lab-risk-gate [data-testid="stProgressBar"] > div > div {
+            background-color: #83aef5;
+          }
+        </style>
+        """
     )
 
 
-def render_sidebar(view: RunView) -> None:
-    with st.sidebar:
-        st.header("Experiment settings")
-        st.caption("Display-only for this completed run")
-        st.text_input(
-            "Max position size",
-            value=view.max_position_size,
-            disabled=True,
+def render_historical_context(view: RunView) -> None:
+    """Render saved-run context before any backtest outcomes."""
+
+    st.markdown("### Current / displayed experiment")
+    with st.container(border=True, key="lab-current-experiment"):
+        st.caption("SAVED HISTORICAL BACKTEST · READ-ONLY ARTIFACT")
+        st.markdown(f"**{view.run_label}**")
+        period, evidence, policy = st.columns((1.7, 1.1, 1.2))
+        period.markdown("**Backtest period**")
+        period.write(view.period)
+        evidence.markdown("**Evidence window**")
+        evidence.write(view.lookback_window)
+        policy.markdown("**Max position limit**")
+        policy.write(view.max_position_size)
+        st.caption(
+            f"Source: {view.data_source} · Gross-exposure limit: {view.max_gross_exposure} · "
+            "Loading this page does not call Gemini."
         )
-        st.text_input(
-            "Max gross exposure",
-            value=view.max_gross_exposure,
-            disabled=True,
-        )
-        st.text_input("Lookback window", value=view.lookback_window, disabled=True)
-        st.divider()
-        st.caption(f"Run: {view.run_name}")
-        st.caption(f"Data: {view.data_source}")
-        st.caption("This page never calls Gemini.")
+        with st.expander("Saved artifact details", expanded=False):
+            st.caption(f"Raw artifact ID: {view.artifact_id}")
 
 
-def render_today_sidebar(view: TodayView) -> None:
-    with st.sidebar:
-        st.header("Today analysis settings")
-        st.caption("Saved with this analysis")
-        st.text_input("Max position size", value=view.max_position_size, disabled=True)
-        st.text_input("Max gross exposure", value=view.max_gross_exposure, disabled=True)
-        st.text_input("Lookback window", value=view.lookback_window, disabled=True)
-        st.divider()
-        st.caption(f"Analysis: {view.run_name}")
-        st.caption(f"Data: {view.data_source}")
-        st.caption("Loading this page never calls Gemini.")
+def render_today_context(view: TodayView) -> None:
+    """Render current-analysis provenance without implying a future performance result."""
+
+    with st.container(border=True, key="lab-analysis-only"):
+        st.badge("ANALYSIS ONLY", color="orange")
+        st.markdown("### Analysis only — no order submitted")
+        st.write(
+            "This is a recorded committee observation using currently available evidence. "
+            "It is not a trade, forecast, or performance result."
+        )
+
+    st.markdown("### Current / displayed analysis")
+    with st.container(border=True, key="lab-today-context"):
+        st.caption("SAVED TODAY ANALYSIS · READ-ONLY ARTIFACT")
+        st.markdown(f"**{view.run_label}**")
+        analysis_run, market_data = st.columns(2)
+        analysis_run.markdown("**Committee analysis ran**")
+        analysis_run.write(view.analysis_timestamp)
+        market_data.markdown("**Market data available through**")
+        market_data.write(view.evidence_as_of)
+        st.caption(
+            "The committee can run after the latest completed daily market bar, so these timestamps "
+            "can differ."
+        )
+        evidence, policy, cash = st.columns((1.25, 1.15, 1.0))
+        evidence.markdown("**Evidence window**")
+        evidence.write(view.lookback_window)
+        policy.markdown("**Max position limit**")
+        policy.write(view.max_position_size)
+        cash.markdown("**Unallocated capital**")
+        cash.write(format_percent(view.cash_residual))
+        st.caption(
+            f"Source: {view.data_source} · This saved analysis does not submit an order."
+        )
+        with st.expander("Saved artifact details", expanded=False):
+            st.caption(f"Raw artifact ID: {view.artifact_id}")
+
+
+def render_metric_summary(view: RunView) -> None:
+    """Render the four saved historical outcomes in a compact native layout."""
+
+    st.markdown("### Backtest outcomes")
+    metrics_columns = st.columns(4)
+    metrics_columns[0].metric(
+        "Portfolio return", format_percent(view.total_return), border=True
+    )
+    metrics_columns[1].metric("SPY return", format_percent(view.benchmark_return), border=True)
+    metrics_columns[2].metric("Max drawdown", format_percent(view.max_drawdown), border=True)
+    metrics_columns[3].metric("Sharpe", f"{view.sharpe_ratio:.2f}", border=True)
+
+
+def render_equity_curve(equity_chart: pd.DataFrame) -> None:
+    """Render the saved portfolio-versus-benchmark curve only for Historical Lab."""
+
+    st.markdown("### Equity curve versus SPY")
+    st.caption("Saved simulated portfolio equity compared with the saved SPY benchmark curve.")
+    st.line_chart(equity_chart, width="stretch", height=340)
+
+
+def render_agent_card(
+    card: AgentCard,
+    *,
+    key: str,
+    portfolio_manager: bool = False,
+) -> None:
+    """Render one concise, artifact-backed role card with optional saved Markdown detail."""
+
+    with st.container(border=True, key=key):
+        if portfolio_manager:
+            st.badge("STRUCTURED PROPOSAL ONLY", color="blue")
+        st.markdown(f"#### {card.role}")
+        st.caption(card.description)
+        st.write(card.preview)
+        if portfolio_manager:
+            st.info("This role proposes target weights only. It cannot submit an order.")
+        if card.details:
+            with st.expander("View saved detail", expanded=False):
+                st.markdown(card.details, unsafe_allow_html=False)
+
+
+def render_committee_workflow(cards: tuple[AgentCard, ...]) -> None:
+    """Make the four saved roles readable as a small decision workflow."""
+
+    cards_by_role = {card.role: card for card in cards}
+    researcher = cards_by_role["Researcher"]
+    bull = cards_by_role["Bull Analyst"]
+    bear = cards_by_role["Bear Analyst"]
+    portfolio_manager = cards_by_role["Portfolio Manager"]
+
+    st.markdown("## How the committee decided")
+    st.caption(
+        "Saved summaries are shown first. Detail is collapsed; raw traces and hidden reasoning are not displayed."
+    )
+    st.markdown("#### Researcher → Bull / Bear → Portfolio Manager")
+    render_agent_card(researcher, key="lab-researcher")
+    bull_column, bear_column = st.columns(2)
+    with bull_column:
+        render_agent_card(bull, key="lab-bull")
+    with bear_column:
+        render_agent_card(bear, key="lab-bear")
+    render_agent_card(
+        portfolio_manager,
+        key="lab-portfolio-manager",
+        portfolio_manager=True,
+    )
+
+
+def _weight_progress_value(weight: float) -> int:
+    """Keep native progress bars bounded even when inspecting a damaged local artifact."""
+
+    if pd.isna(weight):
+        return 0
+    return max(0, min(100, round(weight * 100)))
+
+
+def render_risk_gate(
+    risk_rows: tuple[RiskGateRow, ...],
+    *,
+    max_position_size: str,
+    max_gross_exposure: str,
+    allowed_label: str,
+) -> None:
+    """Render policy approval as the primary, visibly separate system boundary."""
+
+    asset_overrides = tuple(
+        row for row in risk_rows if row.overridden and row.symbol != "CASH"
+    )
+    all_overrides = tuple(row for row in risk_rows if row.overridden)
+
+    st.markdown("## Deterministic Risk Gate")
+    st.caption("The only layer allowed to turn a model proposal into an allocation.")
+    with st.container(border=True, key="lab-risk-gate"):
+        st.markdown(f"### AI proposal → policy → {allowed_label}")
+        st.caption(
+            f"Policy: {max_position_size} maximum per position · "
+            f"{max_gross_exposure} maximum gross exposure"
+        )
+
+        if asset_overrides:
+            focus = max(
+                asset_overrides,
+                key=lambda row: abs(row.proposed_weight - row.executed_weight),
+            )
+            st.warning(
+                f"Policy override: {focus.symbol} proposed "
+                f"{format_percent(focus.proposed_weight)} → {allowed_label.lower()} "
+                f"{format_percent(focus.executed_weight)}."
+            )
+        elif all_overrides:
+            st.warning("Policy left unallocated capital after applying the approved allocations.")
+        else:
+            st.success("No asset allocation required a policy override in this saved result.")
+
+        for row in risk_rows:
+            symbol, proposal, allowed, decision = st.columns((0.8, 1.45, 1.45, 1.0))
+            symbol.markdown(f"**{row.symbol}**")
+            if row.symbol == "CASH":
+                symbol.caption("Unallocated capital")
+            proposal.caption("AI proposal")
+            proposal.progress(
+                _weight_progress_value(row.proposed_weight),
+                text=format_percent(row.proposed_weight),
+            )
+            allowed.caption(allowed_label)
+            allowed.progress(
+                _weight_progress_value(row.executed_weight),
+                text=format_percent(row.executed_weight),
+            )
+            if row.symbol == "CASH":
+                decision.badge("UNALLOCATED CAPITAL", color="gray")
+                decision.caption(row.reason)
+            elif row.overridden:
+                decision.badge("OVERRIDDEN", color="orange")
+                decision.caption(row.reason)
+            else:
+                decision.badge("APPROVED", color="green")
+                decision.caption(row.reason)
+
+
+def render_trades(trades_table: pd.DataFrame) -> None:
+    """Keep simulated execution available but visually secondary to the Risk Gate."""
+
+    with st.expander("Simulated execution details", expanded=False):
+        if trades_table.empty:
+            st.info("No simulated fills were saved for this run.")
+            return
+        st.dataframe(
+            trades_table,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "quantity": st.column_config.NumberColumn("quantity", format="%.0f"),
+                "fill price": st.column_config.NumberColumn("fill price", format="$%.2f"),
+                "notional": st.column_config.NumberColumn("notional", format="$%.2f"),
+            },
+        )
 
 
 def render_system_flow() -> None:
-    with st.expander("How this system works"):
+    """Keep the full historical system boundary available without competing with the Risk Gate."""
+
+    with st.expander("System boundary", expanded=False):
         st.markdown(
-            "### Market data → Researcher → Bull/Bear → Portfolio Manager proposal → "
+            "Market evidence → Researcher → Bull/Bear → Portfolio Manager proposal → "
             "deterministic Risk Gate → simulated broker → backtest result"
         )
         st.write(
-            "The agents interpret saved market evidence and produce a proposal. Deterministic Python "
-            "rules then cap that proposal before the simulated broker can execute it."
+            "Agents interpret evidence and produce a proposal. Deterministic Python enforces "
+            "policy before the simulated broker can execute a saved backtest allocation."
         )
 
 
-def render_today_summary(view: TodayView) -> None:
-    """Render current evidence metadata without implying any realized performance."""
-
-    st.success("Analysis only — no order was submitted.")
-    information, policy, cash = st.columns(3)
-    information.markdown(f"**Analysis timestamp:** {view.analysis_timestamp}")
-    policy.markdown(f"**Evidence:** {view.lookback_window}")
-    cash.metric("Cash residual after Risk Gate", format_percent(view.cash_residual))
-    st.caption(f"Latest completed Yahoo daily bar: {view.evidence_as_of}")
-
-
 def render_today_system_flow() -> None:
-    with st.expander("How this system works"):
+    """Keep the analysis-only system boundary available without implying a broker action."""
+
+    with st.expander("System boundary", expanded=False):
         st.markdown(
-            "### Current evidence → Researcher → Bull/Bear → Portfolio Manager proposal → "
+            "Current evidence → Researcher → Bull/Bear → Portfolio Manager proposal → "
             "deterministic Risk Gate"
         )
         st.write(
             "This records a current-data proposal for later learning. No broker or simulated order "
-            "is involved, and the future outcome is not known yet."
+            "is involved, and no future outcome is known."
         )
 
 
-def render_historical_lab() -> None:
-    """Keep the established backtest-and-saved-run workflow isolated from Today Mode."""
+def render_historical_configuration() -> None:
+    """Put explicit model-backed controls apart from the saved result they cannot alter."""
 
-    settings, run_requested = render_experiment_controls()
-    if run_requested:
+    with st.expander("Configure new experiment", expanded=False):
+        settings, run_requested = render_experiment_controls()
+        if not run_requested:
+            return
         completed_run = run_requested_experiment(settings)
         if completed_run is not None:
             st.session_state["selected_run_dir"] = str(completed_run)
+            st.rerun()
+
+
+def render_today_configuration() -> None:
+    """Put explicit current-data controls apart from the saved analysis they cannot alter."""
+
+    with st.expander("Configure new Today analysis", expanded=False):
+        settings, run_requested = render_today_controls()
+        if not run_requested:
+            return
+        completed_analysis = run_requested_today_analysis(settings)
+        if completed_analysis is not None:
+            st.session_state["selected_today_dir"] = str(completed_analysis)
+            st.rerun()
+
+
+def render_historical_lab() -> None:
+    """Render saved backtest evidence and keep new model runs explicit and separate."""
 
     try:
         run_dir = _displayed_run_dir()
         run = load_run(str(run_dir))
         view = build_presenter_data(run_dir, run)
-    except (
-        FileNotFoundError,
-        KeyError,
-        OSError,
-        TypeError,
-        ValueError,
-        json.JSONDecodeError,
-        pd.errors.ParserError,
-    ) as exc:
-        st.error(f"Could not load a completed backtest run: {exc}")
-        st.stop()
-
-    render_sidebar(view)
-    render_metric_summary(view)
-    st.divider()
-    render_equity_curve(view.equity_chart)
-    st.divider()
-    render_agent_cards(view.agent_cards)
-    st.divider()
-    render_risk_gate(view.risk_rows)
-    st.divider()
-    render_trades(view.trades_table)
-    render_system_flow()
-
-
-def render_today_mode() -> None:
-    """Render a separate current-data proposal workflow with no performance outcome claims."""
-
-    st.caption(
-        "What would the AI Investment Committee propose today, given currently available information?"
-    )
-    settings, run_requested = render_today_controls()
-    if run_requested:
-        completed_analysis = run_requested_today_analysis(settings)
-        if completed_analysis is not None:
-            st.session_state["selected_today_dir"] = str(completed_analysis)
-
-    try:
-        analysis_dir = _displayed_today_dir()
-        analysis = load_today_analysis(str(analysis_dir))
-        view = build_today_presenter_data(analysis_dir, analysis)
     except FileNotFoundError:
-        st.info("No completed Today analysis is saved yet. Run Today's Committee to create one.")
+        st.info("No completed historical backtest is saved yet. Configure one below to begin.")
+        render_historical_configuration()
         return
     except (
         KeyError,
@@ -894,23 +1061,83 @@ def render_today_mode() -> None:
         json.JSONDecodeError,
         pd.errors.ParserError,
     ):
-        st.error("Could not load a completed Today analysis artifact.")
+        st.error("Could not load the selected completed backtest artifact.")
+        render_historical_configuration()
         return
 
-    render_today_sidebar(view)
-    render_today_summary(view)
+    render_historical_context(view)
     st.divider()
-    render_agent_cards(view.agent_cards)
+    render_metric_summary(view)
     st.divider()
-    render_risk_gate(view.risk_rows)
+    render_equity_curve(view.equity_chart)
+    st.divider()
+    render_committee_workflow(view.agent_cards)
+    st.divider()
+    render_risk_gate(
+        view.risk_rows,
+        max_position_size=view.max_position_size,
+        max_gross_exposure=view.max_gross_exposure,
+        allowed_label="Executed allocation",
+    )
+    st.divider()
+    render_trades(view.trades_table)
+    render_system_flow()
+    st.divider()
+    render_historical_configuration()
+
+
+def render_today_mode() -> None:
+    """Render a separate current-data proposal workflow with no outcome claims."""
+
+    st.caption(
+        "What would the AI Investment Committee propose today, given currently available information?"
+    )
+    try:
+        analysis_dir = _displayed_today_dir()
+        analysis = load_today_analysis(str(analysis_dir))
+        view = build_today_presenter_data(analysis_dir, analysis)
+    except FileNotFoundError:
+        st.info("No completed Today analysis is saved yet. Configure one below to begin.")
+        render_today_configuration()
+        return
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        pd.errors.ParserError,
+    ):
+        st.error("Could not load the selected completed Today analysis artifact.")
+        render_today_configuration()
+        return
+
+    render_today_context(view)
+    st.divider()
+    render_committee_workflow(view.agent_cards)
+    st.divider()
+    render_risk_gate(
+        view.risk_rows,
+        max_position_size=view.max_position_size,
+        max_gross_exposure=view.max_gross_exposure,
+        allowed_label="Allowed allocation",
+    )
     render_today_system_flow()
+    st.divider()
+    render_today_configuration()
 
 
 def main() -> None:
-    st.set_page_config(page_title="AI Investment Lab", page_icon="📈", layout="wide")
-    st.title("AI Investment Lab")
-    st.caption("A local learning interface. Loading or refreshing this page never calls Gemini.")
-    mode = st.radio("Mode", (HISTORICAL_LAB, TODAY_MODE), horizontal=True)
+    st.set_page_config(page_title="AI Investment Committee Lab", page_icon="◈", layout="wide")
+    render_lab_styles()
+    st.title("AI Investment Committee Lab")
+    st.caption("LLMs propose. Deterministic policy controls execution.")
+    mode = st.radio(
+        "Mode",
+        (HISTORICAL_LAB, TODAY_MODE),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
     if mode == TODAY_MODE:
         render_today_mode()
     else:

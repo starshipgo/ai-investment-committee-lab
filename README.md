@@ -100,15 +100,23 @@ uv run pytest -q
 
 ## Screenshots
 
-Capture these locally before publishing; the directory exists at `docs/images/`, but no
-screenshots are fabricated or included yet.
+These local screenshots show saved artifacts only; no data or UI states were fabricated.
 
-- **Historical Lab:** save as `docs/images/historical-lab.png`. Show the saved-run summary, equity
-  curve versus SPY, four agent cards, and the Risk Gate.
-- **Today Mode:** save as `docs/images/today-mode.png`. Show the analysis timestamp, completed-bar
-  evidence, four agent cards, allowed allocation, cash residual, and **Analysis only — no order was submitted.**
-- **Risk Gate:** save as `docs/images/risk-gate.png`. Capture a close, readable view of proposed
-  versus executed weights with a deterministic override clearly visible.
+### Historical Lab
+
+![Historical Lab overview](docs/images/historical-lab%201.png)
+
+![Committee workflow](docs/images/historical-lab2.png)
+
+![Deterministic Risk Gate](docs/images/historical-lab3-risk-gate.png)
+
+### Today Mode
+
+![Today Mode overview](docs/images/today-mode1.png)
+
+![Today Mode evidence and committee](docs/images/today-mode2.png)
+
+![Today Mode proposal and allowed allocation](docs/images/today-mode3.png)
 
 ## Safety and scope
 
