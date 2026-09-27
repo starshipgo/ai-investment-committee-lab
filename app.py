@@ -18,7 +18,11 @@ DEFAULT_LOOKBACK_DAYS = 20
 DEFAULT_MAX_POSITION_PERCENT = 25
 HISTORICAL_LAB = "Historical Lab"
 TODAY_MODE = "Today"
+FORWARD_TEST_MODE = "Forward Test"
 TODAY_SUMMARY_FILE = "today_summary.json"
+FORWARD_SUMMARY_FILE = "forward_summary.json"
+FROZEN_DECISION_FILE = "frozen_decision.json"
+FORWARD_PERFORMANCE_FILE = "forward_performance.json"
 ROLE_ORDER = ("Researcher", "Bull Analyst", "Bear Analyst", "Portfolio Manager")
 ROLE_DESCRIPTIONS = {
     "Researcher": "Read-only market evidence",
@@ -105,6 +109,40 @@ class TodayView:
     risk_rows: tuple[RiskGateRow, ...]
 
 
+@dataclass(frozen=True)
+class ForwardHorizon:
+    """One saved, observed-or-pending Forward Test milestone."""
+
+    trading_day: int
+    status: str
+    date: str | None
+    portfolio_return: float | None
+    benchmark_return: float | None
+    relative_return: float | None
+
+
+@dataclass(frozen=True)
+class ForwardTestView:
+    """Presentation-only data for a frozen Today decision and its later observations."""
+
+    run_label: str
+    artifact_id: str
+    data_source: str
+    original_analysis_timestamp: str
+    evidence_as_of: str
+    lookback_window: str
+    max_position_size: str
+    max_gross_exposure: str
+    cash_residual: float
+    risk_rows: tuple[RiskGateRow, ...]
+    observed_trading_days: int
+    current_portfolio_return: float | None
+    current_benchmark_return: float | None
+    current_relative_return: float | None
+    current_observation_date: str | None
+    horizons: tuple[ForwardHorizon, ...]
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -163,6 +201,58 @@ def _safe_today_dir() -> Path:
     raise FileNotFoundError("No completed Today analyses were found under artifacts/today.")
 
 
+def _is_forward_test_dir(path: Path) -> bool:
+    """Recognize only a complete, separate Forward Test artifact."""
+
+    summary_path = path / FORWARD_SUMMARY_FILE
+    frozen_path = path / FROZEN_DECISION_FILE
+    if not summary_path.is_file() or not frozen_path.is_file():
+        return False
+    try:
+        summary = _read_json(summary_path)
+        frozen = _read_json(frozen_path)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        summary.get("artifact_kind") == "forward_test"
+        and summary.get("analysis_only") is True
+        and summary.get("order_submitted") is False
+        and frozen.get("artifact_kind") == "forward_test_frozen_decision"
+    )
+
+
+def _is_forward_child(path: Path) -> bool:
+    return path.resolve().parent == (ARTIFACTS_ROOT / "forward").resolve()
+
+
+def _safe_forward_dir() -> Path:
+    """Resolve a saved Forward Test without fetching Yahoo or calling any agent."""
+
+    latest_path = ARTIFACTS_ROOT / "latest_forward.json"
+    if latest_path.exists():
+        try:
+            artifact_dir = Path(_read_json(latest_path)["artifact_dir"]).resolve()
+        except (KeyError, OSError, TypeError, json.JSONDecodeError):
+            artifact_dir = None
+        if artifact_dir is not None and _is_forward_child(artifact_dir) and _is_forward_test_dir(
+            artifact_dir
+        ):
+            return artifact_dir
+
+    candidates = sorted(
+        (
+            path
+            for path in (ARTIFACTS_ROOT / "forward").glob("*")
+            if _is_forward_child(path) and _is_forward_test_dir(path)
+        ),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    if candidates:
+        return candidates[0]
+    raise FileNotFoundError("No saved Forward Tests were found under artifacts/forward.")
+
+
 @st.cache_data(show_spinner=False)
 def load_run(run_dir_text: str) -> dict[str, Any]:
     """Load only saved artifact files; this function makes no model or network calls."""
@@ -207,6 +297,38 @@ def load_today_analysis(analysis_dir_text: str) -> dict[str, Any]:
     }
 
 
+def _forward_artifact_revision(forward_dir: Path) -> tuple[int, ...]:
+    """Give the cached artifact reader a new key after an explicit outcome refresh."""
+
+    return tuple(
+        (forward_dir / filename).stat().st_mtime_ns
+        if (forward_dir / filename).is_file()
+        else 0
+        for filename in (FORWARD_SUMMARY_FILE, FROZEN_DECISION_FILE, FORWARD_PERFORMANCE_FILE)
+    )
+
+
+@st.cache_data(show_spinner=False)
+def load_forward_test(forward_dir_text: str, revision: tuple[int, ...]) -> dict[str, Any]:
+    """Load only frozen/saved Forward Test artifacts; this function never fetches prices."""
+
+    del revision  # Its only purpose is to invalidate this artifact-only cache after a refresh.
+    forward_dir = Path(forward_dir_text)
+    performance_path = forward_dir / FORWARD_PERFORMANCE_FILE
+    return {
+        "summary": _read_json(forward_dir / FORWARD_SUMMARY_FILE),
+        "frozen": _read_json(forward_dir / FROZEN_DECISION_FILE),
+        "performance": _read_json(performance_path)
+        if performance_path.is_file()
+        else {
+            "status": "waiting_for_future_data",
+            "observed_trading_days": 0,
+            "current": None,
+            "horizons": {},
+        },
+    }
+
+
 def _run_selected_experiment(settings: ExperimentSettings) -> Any:
     """Lazily import Lumibot/Gemini code only after the button is clicked."""
 
@@ -233,6 +355,22 @@ def _run_today_analysis(settings: TodaySettings) -> Any:
     )
 
 
+def _create_forward_test(today_dir: Path) -> Any:
+    """Lazily import the frozen-artifact workflow only after an explicit Today action."""
+
+    from ai_investment_lab.forward import create_forward_test_from_today
+
+    return create_forward_test_from_today(today_dir)
+
+
+def _refresh_forward_test(forward_dir: Path) -> Any:
+    """Lazily fetch only later completed Yahoo bars after an explicit refresh action."""
+
+    from ai_investment_lab.forward import refresh_forward_test
+
+    return refresh_forward_test(forward_dir)
+
+
 def run_experiment_if_requested(
     run_requested: bool,
     settings: ExperimentSettings,
@@ -257,6 +395,32 @@ def run_today_if_requested(
     if not run_requested:
         return None
     return (runner or _run_today_analysis)(settings)
+
+
+def create_forward_test_if_requested(
+    creation_requested: bool,
+    today_dir: Path,
+    *,
+    runner: Callable[[Path], Any] | None = None,
+) -> Any | None:
+    """Keep a Today page load incapable of creating a Forward Test or touching an agent."""
+
+    if not creation_requested:
+        return None
+    return (runner or _create_forward_test)(today_dir)
+
+
+def refresh_forward_test_if_requested(
+    refresh_requested: bool,
+    forward_dir: Path,
+    *,
+    runner: Callable[[Path], Any] | None = None,
+) -> Any | None:
+    """Keep Forward Test page loads incapable of fetching Yahoo observations."""
+
+    if not refresh_requested:
+        return None
+    return (runner or _refresh_forward_test)(forward_dir)
 
 
 def safe_experiment_failure(error: Exception) -> tuple[str, str]:
@@ -294,6 +458,28 @@ def safe_experiment_failure(error: Exception) -> tuple[str, str]:
     return (
         "Experiment did not complete",
         "No completed run was saved. The last successful run remains displayed.",
+    )
+
+
+def safe_forward_failure(error: Exception, *, action: str) -> tuple[str, str]:
+    """Classify Forward Test failures without exposing provider details or local paths."""
+
+    if getattr(error, "safe_category", None) == "market_data":
+        return (
+            "Current market data unavailable",
+            (
+                "Yahoo did not provide a usable completed daily observation. The frozen decision "
+                "and its last saved outcome remain unchanged."
+            ),
+        )
+    if getattr(error, "safe_category", None) == "forward_test":
+        return (
+            "Forward Test could not be updated",
+            "The saved decision could not be safely used for this Forward Test. No order was submitted.",
+        )
+    return (
+        "Forward Test did not complete",
+        f"The {action} did not change the saved decision or submit an order.",
     )
 
 
@@ -439,6 +625,54 @@ def run_requested_today_analysis(settings: TodaySettings) -> Path | None:
         return artifact_dir
 
 
+def run_requested_forward_test_creation(today_dir: Path) -> Path | None:
+    """Freeze a saved Today decision only after the secondary action is clicked."""
+
+    with st.status("Freezing today's saved decision…", expanded=True) as status:
+        status.write("This copies saved evidence and allocation only. It does not call Gemini or submit an order.")
+        try:
+            result = create_forward_test_if_requested(True, today_dir)
+        except Exception as exc:  # noqa: BLE001 - display the safe category only
+            category, message = safe_forward_failure(exc, action="Forward Test creation")
+            status.update(label=category, state="error")
+            st.error(message)
+            return None
+        artifact_dir = Path(result.artifact_dir).resolve()
+        if not _is_forward_child(artifact_dir) or not _is_forward_test_dir(artifact_dir):
+            status.update(label="Incomplete Forward Test artifact", state="error")
+            st.error("The saved Today decision was not converted into a complete Forward Test.")
+            return None
+        if result.reused:
+            status.update(label="Loaded existing Forward Test", state="complete")
+            status.write("This Today decision already has a frozen Forward Test.")
+        else:
+            status.update(label="Forward Test created", state="complete")
+            status.write("A separate frozen Forward Test artifact was saved. No order was submitted.")
+        return artifact_dir
+
+
+def run_requested_forward_refresh(forward_dir: Path) -> Path | None:
+    """Fetch later completed Yahoo bars only after an explicit Forward Test refresh."""
+
+    with st.status("Refreshing observed outcomes…", expanded=True) as status:
+        status.write("Fetching completed Yahoo bars only. The AI decision will not be rerun or changed.")
+        try:
+            result = refresh_forward_test_if_requested(True, forward_dir)
+        except Exception as exc:  # noqa: BLE001 - display the safe category only
+            category, message = safe_forward_failure(exc, action="outcome refresh")
+            status.update(label=category, state="error")
+            st.error(message)
+            return None
+        artifact_dir = Path(result.artifact_dir).resolve()
+        if not _is_forward_child(artifact_dir) or not _is_forward_test_dir(artifact_dir):
+            status.update(label="Incomplete Forward Test artifact", state="error")
+            st.error("The Forward Test outcome could not be saved safely.")
+            return None
+        status.update(label="Observed outcomes refreshed", state="complete")
+        status.write("Only later market outcomes were refreshed; the original allocation remains frozen.")
+        return artifact_dir
+
+
 def _displayed_run_dir() -> Path:
     """Prefer an explicitly selected completed run, then fall back to the latest."""
 
@@ -459,6 +693,17 @@ def _displayed_today_dir() -> Path:
         if _is_today_analysis_dir(candidate):
             return candidate
     return _safe_today_dir()
+
+
+def _displayed_forward_dir() -> Path:
+    """Prefer a selected Forward Test without falling back to Today or historical artifacts."""
+
+    selected = st.session_state.get("selected_forward_test_dir")
+    if selected:
+        candidate = Path(str(selected)).resolve()
+        if _is_forward_child(candidate) and _is_forward_test_dir(candidate):
+            return candidate
+    return _safe_forward_dir()
 
 
 def format_percent(value: float) -> str:
@@ -729,6 +974,74 @@ def build_today_presenter_data(analysis_dir: Path, analysis: dict[str, Any]) -> 
     )
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if pd.notna(result) else None
+
+
+def build_forward_presenter_data(forward_dir: Path, forward_test: dict[str, Any]) -> ForwardTestView:
+    """Adapt only a Forward artifact; never reload or recalculate its source Today decision."""
+
+    summary = forward_test["summary"]
+    frozen = forward_test["frozen"]
+    performance = forward_test["performance"]
+    risk_limits = frozen.get("risk_limits", {})
+    risk_rows = build_risk_rows(pd.DataFrame(frozen.get("risk_decisions", [])))
+    allocation = frozen.get("allowed_allocation", {})
+    current = performance.get("current")
+    if not isinstance(current, dict):
+        current = {}
+    horizon_values = performance.get("horizons", {})
+    if not isinstance(horizon_values, dict):
+        horizon_values = {}
+    horizons: list[ForwardHorizon] = []
+    for trading_day in (1, 5, 20):
+        record = horizon_values.get(str(trading_day), {})
+        if not isinstance(record, dict):
+            record = {}
+        horizons.append(
+            ForwardHorizon(
+                trading_day=trading_day,
+                status=str(record.get("status", "pending")),
+                date=str(record["date"]) if record.get("date") else None,
+                portfolio_return=_optional_float(record.get("portfolio_cumulative_return")),
+                benchmark_return=_optional_float(record.get("spy_cumulative_return")),
+                relative_return=_optional_float(record.get("relative_return")),
+            )
+        )
+    try:
+        observed_days = int(performance.get("observed_trading_days", 0))
+    except (TypeError, ValueError):
+        observed_days = 0
+    try:
+        lookback_days = int(frozen.get("lookback_days", summary.get("lookback_days", 0)))
+    except (TypeError, ValueError):
+        lookback_days = 0
+    return ForwardTestView(
+        run_label=format_saved_run_label("Forward Test", forward_dir.name),
+        artifact_id=forward_dir.name,
+        data_source=str(frozen.get("data_source", summary.get("data_source", "YahooData"))),
+        original_analysis_timestamp=format_timestamp(frozen.get("original_analysis_timestamp")),
+        evidence_as_of=format_timestamp(frozen.get("evidence_as_of")),
+        lookback_window=f"{lookback_days} completed daily bars" if lookback_days else "Frozen evidence",
+        max_position_size=format_percent(float(risk_limits.get("max_position_weight", 0.25))),
+        max_gross_exposure=format_percent(float(risk_limits.get("max_gross_exposure", 1.0))),
+        cash_residual=float(allocation.get("CASH", frozen.get("cash_weight", 0.0))),
+        risk_rows=risk_rows,
+        observed_trading_days=max(0, observed_days),
+        current_portfolio_return=_optional_float(current.get("portfolio_cumulative_return")),
+        current_benchmark_return=_optional_float(current.get("spy_cumulative_return")),
+        current_relative_return=_optional_float(current.get("relative_return")),
+        current_observation_date=str(current["date"]) if current.get("date") else None,
+        horizons=tuple(horizons),
+    )
+
+
 def render_lab_styles() -> None:
     """Apply restrained static styling without ever interpolating artifact content."""
 
@@ -741,7 +1054,8 @@ def render_lab_styles() -> None:
             padding-bottom: 4rem;
           }
           .st-key-lab-current-experiment,
-          .st-key-lab-today-context {
+          .st-key-lab-today-context,
+          .st-key-lab-forward-context {
             background: #111924;
             border: 1px solid #2a394b;
           }
@@ -911,6 +1225,7 @@ def render_risk_gate(
     max_position_size: str,
     max_gross_exposure: str,
     allowed_label: str,
+    proposal_label: str = "AI proposal",
 ) -> None:
     """Render policy approval as the primary, visibly separate system boundary."""
 
@@ -922,7 +1237,7 @@ def render_risk_gate(
     st.markdown("## Deterministic Risk Gate")
     st.caption("The only layer allowed to turn a model proposal into an allocation.")
     with st.container(border=True, key="lab-risk-gate"):
-        st.markdown(f"### AI proposal → policy → {allowed_label}")
+        st.markdown(f"### {proposal_label} → policy → {allowed_label}")
         st.caption(
             f"Policy: {max_position_size} maximum per position · "
             f"{max_gross_exposure} maximum gross exposure"
@@ -948,7 +1263,7 @@ def render_risk_gate(
             symbol.markdown(f"**{row.symbol}**")
             if row.symbol == "CASH":
                 symbol.caption("Unallocated capital")
-            proposal.caption("AI proposal")
+            proposal.caption(proposal_label)
             proposal.progress(
                 _weight_progress_value(row.proposed_weight),
                 text=format_percent(row.proposed_weight),
@@ -1014,6 +1329,133 @@ def render_today_system_flow() -> None:
             "This records a current-data proposal for later learning. No broker or simulated order "
             "is involved, and no future outcome is known."
         )
+
+
+def render_start_forward_test_action(analysis_dir: Path) -> None:
+    """Offer an explicit, no-model way to freeze the displayed Today decision."""
+
+    st.markdown("### Forward Test")
+    st.caption(
+        "Freeze this saved decision for later observation. This does not call Gemini, rerun the "
+        "committee, submit an order, or change this Today analysis."
+    )
+    requested = st.button(
+        "Start Forward Test from this decision",
+        type="secondary",
+        key=f"start-forward-test-{analysis_dir.name}",
+    )
+    if not requested:
+        return
+    forward_dir = run_requested_forward_test_creation(analysis_dir)
+    if forward_dir is None:
+        return
+    st.session_state["selected_forward_test_dir"] = str(forward_dir)
+    # The mode widget is initialized on the next rerun, before it is constructed in main().
+    st.session_state["requested_lab_mode"] = FORWARD_TEST_MODE
+    st.rerun()
+
+
+def render_forward_context(view: ForwardTestView) -> None:
+    """Make the immutable decision/evidence boundary obvious before later outcomes."""
+
+    st.markdown("## Original decision — frozen")
+    with st.container(border=True, key="lab-forward-context"):
+        st.caption("SAVED FORWARD TEST · FROZEN TODAY DECISION")
+        st.markdown(f"**{view.run_label}**")
+        analysis_run, market_data = st.columns(2)
+        analysis_run.markdown("**Original analysis was recorded**")
+        analysis_run.write(view.original_analysis_timestamp)
+        market_data.markdown("**Market data available through**")
+        market_data.write(view.evidence_as_of)
+        st.caption(
+            "The analysis can be recorded after its latest completed market bar. Only bars that became "
+            "available after this market-data cutoff can affect this Forward Test."
+        )
+        evidence, policy, cash = st.columns((1.25, 1.15, 1.0))
+        evidence.markdown("**Frozen evidence window**")
+        evidence.write(view.lookback_window)
+        policy.markdown("**Frozen position limit**")
+        policy.write(view.max_position_size)
+        cash.markdown("**Frozen cash**")
+        cash.write(format_percent(view.cash_residual))
+        st.info("The AI decision is not being updated. Only subsequent market outcomes are changing.")
+        st.caption(
+            f"Source: {view.data_source} · Research / educational use · No live-money trading · "
+            "No order submitted · Not investment advice."
+        )
+        with st.expander("Saved artifact details", expanded=False):
+            st.caption(f"Raw artifact ID: {view.artifact_id}")
+
+
+def render_forward_results(view: ForwardTestView) -> None:
+    """Render saved observed returns only; no outcome appears until later bars exist."""
+
+    st.markdown("## Observed forward result versus SPY")
+    st.caption("Buy-and-hold paper observation of the frozen allowed allocation. Cash earns zero return.")
+    if (
+        view.observed_trading_days == 0
+        or view.current_portfolio_return is None
+        or view.current_benchmark_return is None
+        or view.current_relative_return is None
+    ):
+        st.info("Waiting for future completed market data.")
+        return
+    portfolio, benchmark, relative, days = st.columns(4)
+    portfolio.metric("Portfolio cumulative return", format_percent(view.current_portfolio_return), border=True)
+    benchmark.metric("SPY cumulative return", format_percent(view.current_benchmark_return), border=True)
+    relative.metric("Relative return vs SPY", format_percent(view.current_relative_return), border=True)
+    days.metric("Forward trading days", str(view.observed_trading_days), border=True)
+    if view.current_observation_date:
+        st.caption(f"Latest completed forward observation: {format_date(view.current_observation_date)}.")
+
+
+def render_forward_horizons(view: ForwardTestView) -> None:
+    """Show only observed milestone outcomes and label unavailable horizons as pending."""
+
+    st.markdown("### Milestone observations")
+    columns = st.columns(len(view.horizons))
+    for column, horizon in zip(columns, view.horizons, strict=True):
+        with column:
+            if horizon.status == "observed" and horizon.portfolio_return is not None:
+                st.metric(
+                    f"{horizon.trading_day}-day portfolio return",
+                    format_percent(horizon.portfolio_return),
+                    border=True,
+                )
+                if horizon.date:
+                    st.caption(f"Observed through {format_date(horizon.date)}")
+                if horizon.benchmark_return is not None and horizon.relative_return is not None:
+                    st.caption(
+                        f"SPY {format_percent(horizon.benchmark_return)} · "
+                        f"Relative {format_percent(horizon.relative_return)}"
+                    )
+            else:
+                st.metric(f"{horizon.trading_day}-day observation", "Pending", border=True)
+                st.caption(
+                    f"Awaiting {horizon.trading_day} completed forward trading days; "
+                    "no outcome is fabricated."
+                )
+
+
+def render_forward_refresh_action(forward_dir: Path) -> None:
+    """Keep Yahoo refresh explicit so viewing a Forward Test is read-only and offline."""
+
+    st.caption(
+        "Refresh is optional and fetches only completed Yahoo market data. It never reruns the AI "
+        "committee or changes the frozen allocation."
+    )
+    requested = st.button(
+        "Refresh observed market data",
+        type="secondary",
+        key=f"refresh-forward-test-{forward_dir.name}",
+    )
+    if not requested:
+        return
+    refreshed_dir = run_requested_forward_refresh(forward_dir)
+    if refreshed_dir is None:
+        return
+    st.session_state["selected_forward_test_dir"] = str(refreshed_dir)
+    st.rerun()
 
 
 def render_historical_configuration() -> None:
@@ -1122,9 +1564,54 @@ def render_today_mode() -> None:
         max_gross_exposure=view.max_gross_exposure,
         allowed_label="Allowed allocation",
     )
+    st.divider()
+    render_start_forward_test_action(analysis_dir)
+    st.divider()
     render_today_system_flow()
     st.divider()
     render_today_configuration()
+
+
+def render_forward_test_mode() -> None:
+    """Render a separate saved Forward Test without touching Today, Gemini, or Yahoo on load."""
+
+    st.caption("Observe a frozen Today decision only after later completed market data becomes available.")
+    try:
+        forward_dir = _displayed_forward_dir()
+        forward_test = load_forward_test(
+            str(forward_dir),
+            _forward_artifact_revision(forward_dir),
+        )
+        view = build_forward_presenter_data(forward_dir, forward_test)
+    except FileNotFoundError:
+        st.info("No Forward Test is saved yet. Open a saved Today analysis to freeze its decision.")
+        return
+    except (
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        pd.errors.ParserError,
+    ):
+        st.error("Could not load the selected saved Forward Test artifact.")
+        return
+
+    render_forward_context(view)
+    st.divider()
+    render_risk_gate(
+        view.risk_rows,
+        max_position_size=view.max_position_size,
+        max_gross_exposure=view.max_gross_exposure,
+        allowed_label="Frozen allowed allocation",
+        proposal_label="Frozen AI proposal",
+    )
+    st.divider()
+    render_forward_results(view)
+    st.divider()
+    render_forward_horizons(view)
+    st.divider()
+    render_forward_refresh_action(forward_dir)
 
 
 def main() -> None:
@@ -1132,14 +1619,20 @@ def main() -> None:
     render_lab_styles()
     st.title("AI Investment Committee Lab")
     st.caption("LLMs propose. Deterministic policy controls execution.")
+    requested_mode = st.session_state.pop("requested_lab_mode", None)
+    if requested_mode in {HISTORICAL_LAB, TODAY_MODE, FORWARD_TEST_MODE}:
+        st.session_state["lab_mode"] = requested_mode
     mode = st.radio(
         "Mode",
-        (HISTORICAL_LAB, TODAY_MODE),
+        (HISTORICAL_LAB, TODAY_MODE, FORWARD_TEST_MODE),
         horizontal=True,
         label_visibility="collapsed",
+        key="lab_mode",
     )
     if mode == TODAY_MODE:
         render_today_mode()
+    elif mode == FORWARD_TEST_MODE:
+        render_forward_test_mode()
     else:
         render_historical_lab()
 

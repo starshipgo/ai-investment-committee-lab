@@ -46,6 +46,26 @@ and deterministic allowed allocation.
 It is analysis only: no order is submitted, no broker is connected, and it makes no
 future-performance or price claim.
 
+## Forward Test
+
+Forward Test evaluates a previously saved Today decision without changing it:
+
+`Today decision → freeze risk-gated allocation → observe subsequently available market outcomes → compare with SPY`
+
+Creation copies the original analysis timestamp, evidence cutoff, structured Portfolio Manager
+proposal, deterministic allowed allocation, and cash residual into a separate immutable artifact.
+The frozen allocation is then valued as a buy-and-hold paper portfolio, with cash earning zero
+return. Only completed Yahoo daily bars that became available strictly after the original evidence
+cutoff can contribute to an observation.
+
+Forward Test does not rerun the AI, rebalance, submit an order, or make a forecast. It reports the
+available completed forward trading days, portfolio and SPY cumulative returns, relative return,
+and clearly pending 1-, 5-, and 20-trading-day horizons when the data does not yet exist.
+
+As a local methodology smoke test, one saved decision had 4 completed post-cutoff trading days:
+portfolio **+0.34%**, SPY **-0.28%**, and relative return **+0.62%**. This sample is far too short
+for any performance conclusion.
+
 ## Key learning experiment
 
 A 10-bar context produced an AI proposal of **80% NVDA / 20% AAPL**.
@@ -64,7 +84,7 @@ A 10-bar context produced an AI proposal of **80% NVDA / 20% AAPL**.
 - deterministic policy enforcement
 - fail-closed execution
 - replay/cache-safe state reconstruction
-- backtesting versus current analysis
+- backtesting, current analysis, and frozen forward observation
 
 ## Tech stack
 

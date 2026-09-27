@@ -18,6 +18,8 @@ ExperimentSettings = APP.ExperimentSettings
 TodaySettings = APP.TodaySettings
 run_experiment_if_requested = APP.run_experiment_if_requested
 run_today_if_requested = APP.run_today_if_requested
+create_forward_test_if_requested = APP.create_forward_test_if_requested
+refresh_forward_test_if_requested = APP.refresh_forward_test_if_requested
 safe_experiment_failure = APP.safe_experiment_failure
 
 
@@ -71,6 +73,58 @@ def test_explicit_today_request_passes_both_interactive_settings() -> None:
     )
 
     assert result == settings
+
+
+def test_today_page_load_gate_does_not_create_a_forward_test() -> None:
+    calls: list[Path] = []
+    today_dir = Path("/saved/today")
+
+    result = create_forward_test_if_requested(
+        False,
+        today_dir,
+        runner=lambda received_dir: calls.append(received_dir),
+    )
+
+    assert result is None
+    assert calls == []
+
+
+def test_explicit_forward_creation_passes_only_the_selected_today_artifact() -> None:
+    today_dir = Path("/saved/today")
+
+    result = create_forward_test_if_requested(
+        True,
+        today_dir,
+        runner=lambda received_dir: received_dir,
+    )
+
+    assert result == today_dir
+
+
+def test_forward_page_load_gate_does_not_refresh_market_data() -> None:
+    calls: list[Path] = []
+    forward_dir = Path("/saved/forward")
+
+    result = refresh_forward_test_if_requested(
+        False,
+        forward_dir,
+        runner=lambda received_dir: calls.append(received_dir),
+    )
+
+    assert result is None
+    assert calls == []
+
+
+def test_explicit_forward_refresh_passes_only_the_selected_forward_artifact() -> None:
+    forward_dir = Path("/saved/forward")
+
+    result = refresh_forward_test_if_requested(
+        True,
+        forward_dir,
+        runner=lambda received_dir: received_dir,
+    )
+
+    assert result == forward_dir
 
 
 def test_lookback_display_prefers_saved_experiment_configuration() -> None:
@@ -199,3 +253,118 @@ def test_historical_latest_finder_never_selects_a_today_artifact(
     monkeypatch.setattr(APP, "ARTIFACTS_ROOT", artifacts_root)
 
     assert APP._safe_run_dir() == historical
+
+
+def test_forward_presenter_reads_only_frozen_forward_artifact(tmp_path: Path) -> None:
+    forward_dir = tmp_path / "artifacts" / "forward" / "20260924T010203000000Z"
+    forward_dir.mkdir(parents=True)
+    (forward_dir / "forward_summary.json").write_text(
+        json.dumps(
+            {
+                "artifact_kind": "forward_test",
+                "analysis_only": True,
+                "order_submitted": False,
+                "data_source": "YahooData",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (forward_dir / "frozen_decision.json").write_text(
+        json.dumps(
+            {
+                "artifact_kind": "forward_test_frozen_decision",
+                "data_source": "YahooData",
+                "original_analysis_timestamp": "2026-09-23T01:02:03+00:00",
+                "evidence_as_of": "2026-09-22T00:00:00+00:00",
+                "lookback_days": 10,
+                "risk_limits": {"max_position_weight": 0.25, "max_gross_exposure": 1.0},
+                "allowed_allocation": {"AAPL": 0.25, "MSFT": 0.1, "NVDA": 0.1, "CASH": 0.55},
+                "risk_decisions": [
+                    {
+                        "symbol": "AAPL",
+                        "proposed_weight": 0.7,
+                        "executed_weight": 0.25,
+                        "overridden": True,
+                        "reason": "max_position_25pct",
+                    },
+                    {
+                        "symbol": "CASH",
+                        "proposed_weight": 0.1,
+                        "executed_weight": 0.55,
+                        "overridden": True,
+                        "reason": "residual_after_risk_gate",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (forward_dir / "forward_performance.json").write_text(
+        json.dumps(
+            {
+                "observed_trading_days": 2,
+                "current": {
+                    "date": "2026-09-24",
+                    "portfolio_cumulative_return": 0.02,
+                    "spy_cumulative_return": 0.01,
+                    "relative_return": 0.01,
+                },
+                "horizons": {
+                    "1": {
+                        "status": "observed",
+                        "trading_day": 1,
+                        "date": "2026-09-23",
+                        "portfolio_cumulative_return": 0.01,
+                        "spy_cumulative_return": 0.0,
+                        "relative_return": 0.01,
+                    },
+                    "5": {"status": "pending", "trading_day": 5},
+                    "20": {"status": "pending", "trading_day": 20},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = APP.load_forward_test(str(forward_dir), (1, 1, 1))
+    view = APP.build_forward_presenter_data(forward_dir, loaded)
+
+    assert view.lookback_window == "10 completed daily bars"
+    assert view.cash_residual == pytest.approx(0.55)
+    assert view.observed_trading_days == 2
+    assert view.current_relative_return == pytest.approx(0.01)
+    assert view.horizons[0].status == "observed"
+    assert view.horizons[1].status == "pending"
+    assert not hasattr(view, "total_return")
+    assert not hasattr(view, "agent_cards")
+
+
+def test_forward_finder_rejects_today_and_historical_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts_root = tmp_path / "artifacts"
+    today = artifacts_root / "today" / "20260923T010203000000Z"
+    historical = artifacts_root / "runs" / "20260922T010203000000Z"
+    today.mkdir(parents=True)
+    historical.mkdir(parents=True)
+    (today / "forward_summary.json").write_text(
+        json.dumps({"artifact_kind": "forward_test", "analysis_only": True, "order_submitted": False}),
+        encoding="utf-8",
+    )
+    (today / "frozen_decision.json").write_text(
+        json.dumps({"artifact_kind": "forward_test_frozen_decision"}), encoding="utf-8"
+    )
+    (historical / "forward_summary.json").write_text(
+        json.dumps({"artifact_kind": "forward_test", "analysis_only": True, "order_submitted": False}),
+        encoding="utf-8",
+    )
+    (historical / "frozen_decision.json").write_text(
+        json.dumps({"artifact_kind": "forward_test_frozen_decision"}), encoding="utf-8"
+    )
+    monkeypatch.setattr(APP, "ARTIFACTS_ROOT", artifacts_root)
+
+    assert not APP._is_forward_child(today)
+    assert not APP._is_forward_child(historical)
+    with pytest.raises(FileNotFoundError):
+        APP._safe_forward_dir()
